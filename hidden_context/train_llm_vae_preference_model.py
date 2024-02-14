@@ -1,29 +1,28 @@
 import os
 from dataclasses import dataclass, field
-from functools import partial
 from typing import Any, Dict, List, Optional, Type, Union, cast
 
 import numpy as np
 import torch
-from datasets import Dataset, concatenate_datasets, load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
-from torch import nn
-from torch.optim.lr_scheduler import LambdaLR
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     HfArgumentParser,
     PreTrainedTokenizerBase,
-    Trainer,
     TrainingArguments,
 )
-from transformers.trainer_utils import EvalPrediction
 from transformers.utils import PaddingStrategy
-from typing_extensions import Literal, TypeAlias
-from .vae_utils import Decoder, Encoder, VAEModel, Annealer
+from .vae_utils import VAETrainer, VAEModel
 
-RewardModelType: TypeAlias = Literal["base", "mean_and_variance", "categorical"]
-DataSubset: TypeAlias = Literal["both", "helpful", "harmless"]
+from .train_llm_preference_model import (
+    get_step_decay_lr_lambda,
+    get_cosine_decay_lr_lambda,
+    RewardModelType,
+    DataSubset,
+    get_hh_rlhf_dataset,
+)
+
 
 @dataclass
 class ScriptArguments:
@@ -137,6 +136,7 @@ class ScriptArguments:
     log_dir: str = field(default="data/reward_models/hh_rlhf")
     kl_loss_weight: float = field(default=0.01)
     latent_dim: int = field(default=512)
+    hidden_dim: int = field(default=512)
     embed_dim: int = field(default=1024)
     use_annealing: bool = field(default=True)
 
@@ -152,11 +152,13 @@ class HHRLHFPreprocessor(object):
             "attention_mask_chosen": [],
             "input_ids_rejected": [],
             "attention_mask_rejected": [],
+            "contexts": [],
         }
-        for chosen, rejected in zip(examples["chosen"], examples["rejected"]):
+        for chosen, rejected, contexts in zip(
+            examples["chosen"], examples["rejected"], examples["contexts"]
+        ):
             tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
             tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
-            tokenized_rejected = self.tokenizer(chosen + "" + rejected, **self.tokenizer_kwargs)
             new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
             new_examples["attention_mask_chosen"].append(
                 tokenized_chosen["attention_mask"]
@@ -166,170 +168,26 @@ class HHRLHFPreprocessor(object):
                 tokenized_rejected["attention_mask"]
             )
 
+            tokenized_context = []
+            # Tokenize the contexts.
+            for chosen, rejected in zip(contexts["chosen"], contexts["rejected"]):
+                tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
+                tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
+                tokenized_context.append(
+                    {
+                        "input_ids_chosen": tokenized_chosen["input_ids"],
+                        "attention_mask_chosen": tokenized_chosen["attention_mask"],
+                        "input_ids_rejected": tokenized_rejected["input_ids"],
+                        "attention_mask_rejected": tokenized_rejected["attention_mask"],
+                    }
+                )
+            new_examples["contexts"].append(tokenized_context)
         return new_examples
 
 
-def get_step_decay_lr_lambda(current_step: int, *, num_training_steps: int):
-    if current_step < num_training_steps // 3:
-        return 1.0
-    elif current_step < (2 * num_training_steps) // 3:
-        return 0.1
-    else:
-        return 0.01
-
-
-def get_cosine_decay_lr_lambda(current_step: int, *, num_training_steps: int):
-    return 0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * current_step / num_training_steps))
-
-
-class RewardTrainer(Trainer):
-    def __init__(self, *args, lr_lambda=None, kl_loss_weight=None, use_annealing=False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.lr_lambda = lr_lambda
-        self.kl_loss_weight = kl_loss_weight
-        self.use_annealing = use_annealing
-        self.annealer = Annealer(total_steps=1e4, shape='cosine', baseline=0.1, cyclical=True)
-
-    @classmethod
-    def per_sample_loss(cls, rewards_chosen, rewards_rejected):
-        return -nn.functional.logsigmoid(rewards_chosen - rewards_rejected)
-
-    def loss(self, rewards_chosen, rewards_rejected):
-        return torch.mean(self.per_sample_loss(rewards_chosen, rewards_rejected))
-
-    def compute_loss(self, model, inputs, return_outputs=False):
-        embeddings = model.llm(
-            torch.concatenate(
-                [
-                    inputs["input_ids_chosen"],
-                    inputs["input_ids_rejected"],
-                ],
-                dim=0,
-            ),
-            torch.concatenate(
-                [
-                    inputs["attention_mask_chosen"],
-                    inputs["attention_mask_rejected"],
-                ],
-                dim=0,
-            ),
-        )[0]
-        # embeddings = embeddings.mean(dim=1)
-        embeddings = embeddings.reshape(2, -1, embeddings.shape[-1])
-        e0 = embeddings[0]
-        e1 = embeddings[1]
-        fused_embed = torch.cat([e0, e1], dim=-1)
-
-        _, rewards_chosen, rewards_rejected, mean, log_var = model(fused_embed, e0, e1)
-        reproduction_loss = self.loss(rewards_chosen, rewards_rejected)
-        # kld = -self.kl_loss_weight * torch.sum(
-        #     1
-        #     + (log_var - model.prior_log_var)
-        #     - (log_var - model.prior_log_var).exp()
-        #     - (mean.pow(2) - model.prior_mean.pow(2)) / (model.prior_log_var.exp())
-        # )
-        kld = - torch.sum(1+ log_var - mean.pow(2) - log_var.exp())
-        if self.use_annealing:
-            kld = self.annealer(kld)
-            self.annealer.step()
-        # else:
-        kld = self.kl_loss_weight * kld
-        loss = reproduction_loss + kld
-        
-        accuracy = torch.mean((rewards_chosen > rewards_rejected).float())
-        self.log({
-            "train_loss": reproduction_loss.mean().item(),
-            "train_kld": kld.mean().item(),
-            "train_accuracy": accuracy.mean().item()
-        })
-
-        if return_outputs:
-            return loss, {
-                "rewards_chosen": rewards_chosen,
-                "rewards_rejected": rewards_rejected,
-                "mean": mean,
-                "log_var": log_var,
-                "model_mean": model.prior_mean,
-                "model_log_var": model.prior_log_var,
-            }
-        return loss
-
-    def create_scheduler(self, num_training_steps: int, optimizer=None):
-        if self.lr_lambda is not None:
-            lr_lambda = partial(
-                self.lr_lambda,
-                num_training_steps=num_training_steps,
-            )
-            self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
-            return self.lr_scheduler
-        else:
-            return super().create_scheduler(num_training_steps, optimizer)
-
-    @classmethod
-    def compute_metrics(cls, eval_prediction: EvalPrediction):
-        rewards_chosen, rewards_rejected, mean, log_var, model_mean, model_log_var  = eval_prediction.predictions
-        rewards_chosen = torch.from_numpy(rewards_chosen)
-        rewards_rejected = torch.from_numpy(rewards_rejected)
-        mean = torch.from_numpy(mean)
-        log_var = torch.from_numpy(log_var)
-        model_mean = torch.from_numpy(model_mean).view(mean.shape)
-        model_log_var = torch.from_numpy(model_log_var).view(log_var.shape)
-        
-        loss = cls.per_sample_loss(rewards_chosen, rewards_rejected)
-        kld = -torch.sum(
-            1
-            + (log_var - model_log_var)
-            - (log_var - model_log_var).exp()
-            - (mean.pow(2) - model_mean.pow(2)) / (model_log_var.exp())
-        )
-        accuracy = torch.mean((loss < np.log(2)).float())
-
-        return {
-            "loss": loss.mean().item(),
-            "accuracy": accuracy.item(),
-            "kld": kld.item(),
-            "total_loss": loss.mean().item() + kld.item(),
-        }
-
-def get_hh_rlhf_dataset(
-    data_subset: DataSubset,
-    split: Literal["train", "test"],
-    dataset_size: int = 0,
-    data_path="Anthropic/hh-rlhf",
-) -> Dataset:
-    datasets: List[Dataset] = []
-    if data_path == "Anthropic/hh-rlhf":
-        if data_subset == "harmless" or data_subset == "both":
-            datasets.append(
-                load_dataset(
-                    "Anthropic/hh-rlhf", data_dir="harmless-base", split=split
-                ).map(lambda data: {"data_subset": "harmless"})
-            )
-        if data_subset == "helpful" or data_subset == "both":
-            datasets.append(
-                load_dataset(
-                    "Anthropic/hh-rlhf", data_dir="helpful-base", split=split
-                ).map(lambda data: {"data_subset": "helpful"})
-            )
-    else:
-        datasets.append(
-            load_dataset(data_path, split=split).map(
-                lambda data: {"data_subset": data_subset}
-            )
-        )
-
-    if dataset_size:
-        datasets = [
-            dataset.select(range(dataset_size // len(datasets))) for dataset in datasets
-        ]
-
-    return concatenate_datasets(datasets)
-
-
-trainer_classes: Dict[RewardModelType, Type[RewardTrainer]] = {
-    "vae": RewardTrainer,
+trainer_classes: Dict[RewardModelType, Type[VAETrainer]] = {
+    "vae": VAETrainer,
 }
-
 
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
@@ -470,8 +328,12 @@ if __name__ == "__main__":
         return_tensors: str = "pt"
 
         def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+            batch_size = len(features)
             features_chosen = []
             features_rejected = []
+            features_context_chosen = []
+            features_context_rejected = []
+            context_lengths = [0]
             for feature in features:
                 features_chosen.append(
                     {
@@ -485,6 +347,29 @@ if __name__ == "__main__":
                         "attention_mask": feature["attention_mask_rejected"],
                     }
                 )
+
+                # Creating a flattened list of contexts.
+                features_context_chosen.extend(
+                    [
+                        {
+                            "input_ids": context["input_ids_chosen"],
+                            "attention_mask": context["attention_mask_chosen"],
+                        }
+                        for context in feature["contexts"]
+                    ]
+                )
+                features_context_rejected.extend(
+                    [
+                        {
+                            "input_ids": context["input_ids_rejected"],
+                            "attention_mask": context["attention_mask_rejected"],
+                        }
+                        for context in feature["contexts"]
+                    ]
+                )
+                # Keep track of the start and end of each sequence.
+                context_lengths.append(len(feature["contexts"]))
+
             batch = self.tokenizer.pad(
                 features_chosen + features_rejected,
                 padding=self.padding,
@@ -492,23 +377,51 @@ if __name__ == "__main__":
                 pad_to_multiple_of=self.pad_to_multiple_of,
                 return_tensors=self.return_tensors,
             )
-            input_ids = batch["input_ids"].view(2, -1, batch["input_ids"].shape[-1])
-            attention_mask = batch["attention_mask"].view(
-                2, -1, batch["attention_mask"].shape[-1]
+
+            context_batch = self.tokenizer.pad(
+                features_context_chosen + features_context_rejected,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors=self.return_tensors,
             )
+
+            input_ids = batch["input_ids"].view(
+                2, batch_size, batch["input_ids"].shape[-1]
+            )
+            attention_mask = batch["attention_mask"].view(
+                2, batch_size, batch["attention_mask"].shape[-1]
+            )
+
+            context_ids = context_batch["input_ids"].view(
+                2, context_lengths[-1], context_batch["input_ids"].shape[-1]
+            )
+            context_attention_mask = context_batch["attention_mask"].view(
+                2, context_lengths[-1], context_batch["attention_mask"].shape[-1]
+            )
+
+            context_lengths = torch.cumsum(torch.tensor(context_lengths), dim=0)
+            seq_start_end = torch.stack(
+                [context_lengths[:-1], context_lengths[1:]], dim=1
+            )
+            assert len(seq_start_end) == batch_size
+
             return {
                 "input_ids_chosen": input_ids[0],
                 "attention_mask_chosen": attention_mask[0],
                 "input_ids_rejected": input_ids[1],
                 "attention_mask_rejected": attention_mask[1],
+                "input_ids_context_chosen": context_ids[0],
+                "attention_mask_context_chosen": context_attention_mask[0],
+                "input_ids_context_rejected": context_ids[1],
+                "attention_mask_context_rejected": context_attention_mask[1],
                 "return_loss": True,
             }
 
     # Train the model.
     latent_dim = script_args.latent_dim
-    encoder = Encoder(embed_dim=embed_dim, latent_dim=latent_dim, hidden_dim=512)
-    decoder = Decoder(input_dim=(latent_dim+embed_dim), hidden_dim=512)
-    vae_model = VAEModel(encoder, decoder, model, latent_dim=latent_dim, learned_prior=False)
+    hidden_dim = script_args.hidden_dim
+    vae_model = VAEModel(embed_dim, hidden_dim, latent_dim, model)
 
     trainer = trainer_class(
         model=vae_model,
@@ -533,8 +446,6 @@ if __name__ == "__main__":
     model.save_pretrained(output_name + "_peft_last_checkpoint")
     output_name += "_peft_last_checkpoint"
     os.makedirs(output_name, exist_ok=True)
-    torch.save(vae_model.Encoder.state_dict(), f"{output_name}/final_vae_model_encoder_state_dict.pt")
-    torch.save(vae_model.Decoder.state_dict(), f"{output_name}/final_vae_model_decoder_state_dict.pt")
-    torch.save(vae_model.prior_mean, f"{output_name}/final_vae_model_mean_state_dict.pt")
-    torch.save(vae_model.prior_log_var, f"{output_name}/final_vae_model_log_var_state_dict.pt")
-    torch.save(vae_model, f"{output_name}/final_vae_model.pt")
+
+    output_name = os.path.join(output_name, "model.pt")
+    vae_model.save_model(output_name)

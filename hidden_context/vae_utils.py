@@ -1,42 +1,69 @@
-
-import torch
-import torch.nn as nn
 import math
+from functools import partial
 
-class PreFusionEncoder(nn.Module):
-    def __init__(self, embed_dim, latent_dim):
-        super(PreFusionEncoder, self).__init__()
-        self.FC_mean = nn.Linear(embed_dim, latent_dim)
-        self.FC_var = nn.Linear(embed_dim, latent_dim)
+import numpy as np
+import torch
+from torch.optim.lr_scheduler import LambdaLR
+import torch.nn.functional as F
+import torch.nn as nn
+from transformers import Trainer, EvalPrediction
 
-    def forward(self, x):
-        x = x.bfloat16()
-        mean = self.FC_mean(x)
-        log_var = self.FC_var(x)
-        return mean, log_var
-    
-class Encoder(nn.Module):
-    def __init__(self, embed_dim, latent_dim, hidden_dim):
-        super(Encoder, self).__init__()
+
+class PairEncoder(nn.Module):
+    """
+    Model to encode pair of accepted and rejected responses
+    """
+
+    def __init__(self, embed_dim, output_dim, hidden_dim):
+        super(PairEncoder, self).__init__()
 
         self._model = nn.Sequential(
-            nn.Linear(2*embed_dim, hidden_dim),
+            nn.Linear(2 * embed_dim, hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
-            # nn.Linear(hidden_dim, hidden_dim),
-            # nn.LeakyReLU(0.2),
-            # nn.Linear(hidden_dim, hidden_dim),
-            # nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, output_dim),
         )
-        self.FC_mean = nn.Linear(hidden_dim, latent_dim)
-        self.FC_var = nn.Linear(hidden_dim, latent_dim)
 
-    def forward(self, x):
-        h_ = self._model(x)
-        mean = self.FC_mean(h_)
-        log_var = self.FC_var(h_)
-        return mean, log_var
+    def forward(self, e_c, e_r):
+        x = torch.cat([e_c, e_r], dim=1)
+        return self._model(x)
+
+
+class SequenceEncoder(nn.Module):
+    """
+    Model to encode sequence of responses
+    """
+
+    def __init__(self, input_dim, latent_dim):
+        super(SequenceEncoder, self).__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+
+        self.linear = nn.Identity()  # TODO: Do we need linear layer?
+        self.mean_layer = nn.Linear(input_dim, latent_dim)
+        self.log_var_layer = nn.Linear(input_dim, latent_dim)
+
+    def forward(
+        self, sequences, seq_start_end
+    ):  # (C_1+C_2+...+C_n, D), [(0, C_1), (C_1, C_1+C_2), ..., (C_1+...+C_n-1, C_1+...+C_n)]
+        outputs = []
+        for _, (start, end) in enumerate(seq_start_end):
+            context = sequences[start:end]  # C_i x D
+            transformed_seq = self.linear(context)  # C_i x D'
+            attention_scores = torch.matmul(
+                transformed_seq, transformed_seq.transpose(0, 1)
+            )  # C_i x C_i
+            attention_scores = attention_scores / (context.shape[-1] ** 0.5)
+            attention_weights = F.softmax(attention_scores, dim=-1)  # C_i x C_i
+            weighted_values = torch.matmul(attention_weights, context)  # C_i x D
+            output = torch.sum(weighted_values, dim=0)  # D
+            outputs.append(output)
+        outputs = torch.stack(outputs, dim=0)  # n x D
+
+        mean = self.mean_layer(outputs)
+        log_var = self.log_var_layer(outputs)
+        return outputs, mean, log_var
 
 
 class Decoder(nn.Module):
@@ -47,47 +74,192 @@ class Decoder(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x):
-        return self._model(x)
+    def forward(self, xc, xr, z):
+        xc = torch.cat([xc, z], dim=1)
+        xr = torch.cat([xr, z], dim=1)
+        rc = self.Decoder(xc)
+        rr = self.Decoder(xr)
+        return rc, rr
 
 
 class VAEModel(nn.Module):
-    def __init__(self, encoder, decoder, llm, latent_dim, learned_prior=False):
+    def __init__(self, embed_dim, hidden_dim, latent_dim, llm_encoder):
         super(VAEModel, self).__init__()
-        self.Encoder = encoder
-        self.Decoder = decoder
-        self.llm = llm
+        self.llm_encoder = llm_encoder
+        self.pair_encoder = PairEncoder(embed_dim, hidden_dim, latent_dim)
+        self.sequence_encoder = SequenceEncoder(embed_dim, latent_dim)
+        self.decoder = Decoder(embed_dim + latent_dim, hidden_dim)
+
         self.latent_dim = latent_dim
-        self.prior_mean = torch.nn.Parameter(
-            torch.zeros(latent_dim), requires_grad=learned_prior
-        )
-        self.prior_log_var = torch.nn.Parameter(
-            torch.zeros(latent_dim), requires_grad=learned_prior
-        )
 
     def reparameterization(self, mean, var):
         epsilon = torch.randn_like(var).to(mean.device)  # sampling epsilon
         z = mean + var * epsilon  # reparameterization trick
         return z
 
-    def forward(self, fused, e0, e1):
-        # encoder_input = torch.cat([e0, e1], dim=1).reshape(e0.shape[0], -1)
-        mean, log_var = self.Encoder(fused)
+    def encode_pair(self, e_c, e_r):
+        return self.pair_encoder(e_c, e_r)
+
+    def encode_sequence(self, sequences, seq_start_end):
+        return self.sequence_encoder(sequences, seq_start_end)
+
+    def decode(self, e_c, e_r, z):
+        return self.decoder(e_c, e_r, z)
+
+    def forward(
+        self,
+        target_chosen,
+        target_rejected,
+        context_chosen,
+        context_rejected,
+        seq_start_end,
+    ):
+        pair_embed = self.encode_pair(context_chosen, context_rejected)
+
+        mean, log_var = self.encode_sequence(pair_embed, seq_start_end)
         z = self.reparameterization(mean, torch.exp(0.5 * log_var))
 
-        x0 = torch.cat([e0, z], dim=1)
-        x1 = torch.cat([e1, z], dim=1)
-        r0 = self.Decoder(x0)
-        r1 = self.Decoder(x1)
-        # p = torch.sigmoid(r0 - r1)
-        return None, r0, r1, mean, log_var
+        rc, rr = self.decode(target_chosen, target_rejected, z)
+
+        return rc, rr, mean, log_var
+
+    def save_model(self, path):
+        state_dict = {
+            "pair_encoder": self.pair_encoder.state_dict(),
+            "sequence_encoder": self.sequence_encoder.state_dict(),
+            "decoder": self.decoder.state_dict(),
+            "latent_dim": self.latent_dim,
+        }
+        torch.save(state_dict, path)
+
+    def load_model(self, path, llm_encoder):
+        state_dict = torch.load(path)
+        self.pair_encoder.load_state_dict(state_dict["pair_encoder"])
+        self.sequence_encoder.load_state_dict(state_dict["sequence_encoder"])
+        self.decoder.load_state_dict(state_dict["decoder"])
+        self.latent_dim = state_dict["latent_dim"]
+        self.llm_encoder = llm_encoder
+
+
+class VAETrainer(Trainer):
+    def __init__(
+        self, *args, lr_lambda=None, kl_loss_weight=None, use_annealing=False, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.lr_lambda = lr_lambda
+        self.kl_loss_weight = kl_loss_weight
+        self.use_annealing = use_annealing
+        self.annealer = Annealer(
+            total_steps=1e4, shape="cosine", baseline=0.1, cyclical=True
+        )
+
+    @classmethod
+    def per_sample_loss(cls, rewards_chosen, rewards_rejected):
+        return -nn.functional.logsigmoid(rewards_chosen - rewards_rejected)
+
+    def loss(self, rewards_chosen, rewards_rejected):
+        return torch.mean(self.per_sample_loss(rewards_chosen, rewards_rejected))
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        embeddings = model(
+            torch.concatenate(
+                [
+                    inputs["input_ids_chosen"],
+                    inputs["input_ids_rejected"],
+                    inputs["context_input_ids_chosen"],
+                    inputs["context_input_ids_rejected"],
+                ],
+                dim=0,
+            ),
+            torch.concatenate(
+                [
+                    inputs["attention_mask_chosen"],
+                    inputs["attention_mask_rejected"],
+                    inputs["context_attention_mask_chosen"],
+                    inputs["context_attention_mask_rejected"],
+                ],
+                dim=0,
+            ),
+        )[0]
+
+        batch_size = inputs["input_ids_chosen"].shape[0]
+        target_chosen = embeddings[:batch_size]
+        target_rejected = embeddings[batch_size:2*batch_size]
+
+        context = embeddings[2*batch_size:]
+        context_chosen = embeddings[: len(context) // 2]
+        context_rejected = embeddings[len(context) // 2 :]
+        seq_start_end = inputs["seq_start_end"]
+
+        rewards_chosen, rewards_rejected, mean, log_var = model(
+            target_chosen,
+            target_rejected,
+            context_chosen,
+            context_rejected,
+            seq_start_end,
+        )
+
+        reproduction_loss = self.loss(rewards_chosen, rewards_rejected)
+        kld = -torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        if self.use_annealing:
+            kld = self.annealer(kld)
+            self.annealer.step()
+        kld = self.kl_loss_weight * kld
+        loss = reproduction_loss + kld
+        accuracy = torch.mean((rewards_chosen > rewards_rejected).float())
+        self.log(
+            {
+                "train_loss": reproduction_loss.mean().item(),
+                "train_kld": kld.mean().item(),
+                "train_accuracy": accuracy.mean().item(),
+            }
+        )
+
+        if return_outputs:
+            return loss, {
+                "rewards_chosen": rewards_chosen,
+                "rewards_rejected": rewards_rejected,
+                "mean": mean,
+                "log_var": log_var,
+            }
+        return loss
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        if self.lr_lambda is not None:
+            lr_lambda = partial(
+                self.lr_lambda,
+                num_training_steps=num_training_steps,
+            )
+            self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
+            return self.lr_scheduler
+        else:
+            return super().create_scheduler(num_training_steps, optimizer)
+
+    @classmethod
+    def compute_metrics(cls, eval_prediction: EvalPrediction):
+        rewards_chosen, rewards_rejected, mean, log_var, model_mean, model_log_var = (
+            eval_prediction.predictions
+        )
+        rewards_chosen = torch.from_numpy(rewards_chosen)
+        rewards_rejected = torch.from_numpy(rewards_rejected)
+        mean = torch.from_numpy(mean)
+        log_var = torch.from_numpy(log_var)
+        model_mean = torch.from_numpy(model_mean).view(mean.shape)
+        model_log_var = torch.from_numpy(model_log_var).view(log_var.shape)
+
+        loss = cls.per_sample_loss(rewards_chosen, rewards_rejected)
+        kld = -torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+        accuracy = torch.mean((loss < np.log(2)).float())
+
+        return {
+            "loss": loss.mean().item(),
+            "accuracy": accuracy.item(),
+            "kld": kld.item(),
+            "total_loss": loss.mean().item() + kld.item(),
+        }
 
 
 class Annealer:
@@ -111,7 +283,7 @@ class Annealer:
         self.shape = shape
         self.baseline = baseline
         if disable:
-            self.shape = 'none'
+            self.shape = "none"
             self.baseline = 0.0
 
     def __call__(self, kld):
@@ -125,17 +297,19 @@ class Annealer:
         return out
 
     def slope(self):
-        if self.shape == 'linear':
-            y = (self.current_step / self.total_steps)
-        elif self.shape == 'cosine':
+        if self.shape == "linear":
+            y = self.current_step / self.total_steps
+        elif self.shape == "cosine":
             y = (math.cos(math.pi * (self.current_step / self.total_steps - 1)) + 1) / 2
-        elif self.shape == 'logistic':
-            exponent = ((self.total_steps / 2) - self.current_step)
+        elif self.shape == "logistic":
+            exponent = (self.total_steps / 2) - self.current_step
             y = 1 / (1 + math.exp(exponent))
-        elif self.shape == 'none':
+        elif self.shape == "none":
             y = 1.0
         else:
-            raise ValueError('Invalid shape for annealing function. Must be linear, cosine, or logistic.')
+            raise ValueError(
+                "Invalid shape for annealing function. Must be linear, cosine, or logistic."
+            )
         y = self.add_baseline(y)
         return y
 
@@ -152,7 +326,9 @@ class Annealer:
 
     def cyclical_setter(self, value):
         if value is not bool:
-            raise ValueError('Cyclical_setter method requires boolean argument (True/False)')
+            raise ValueError(
+                "Cyclical_setter method requires boolean argument (True/False)"
+            )
         else:
             self.cyclical = value
         return
