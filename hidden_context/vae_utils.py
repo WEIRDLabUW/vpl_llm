@@ -127,21 +127,21 @@ class VAEModel(nn.Module):
         return rc, rr, mean, log_var
 
     def save_model(self, path):
-        state_dict = {
-            "pair_encoder": self.pair_encoder.state_dict(),
-            "sequence_encoder": self.sequence_encoder.state_dict(),
-            "decoder": self.decoder.state_dict(),
-            "latent_dim": self.latent_dim,
-        }
-        torch.save(state_dict, path)
+        # state_dict = {
+        #     "pair_encoder": self.pair_encoder.state_dict(),
+        #     "sequence_encoder": self.sequence_encoder.state_dict(),
+        #     "decoder": self.decoder.state_dict(),
+        #     "latent_dim": self.latent_dim,
+        # }
+        torch.save(self, path)
 
-    def load_model(self, path, llm_encoder):
-        state_dict = torch.load(path)
-        self.pair_encoder.load_state_dict(state_dict["pair_encoder"])
-        self.sequence_encoder.load_state_dict(state_dict["sequence_encoder"])
-        self.decoder.load_state_dict(state_dict["decoder"])
-        self.latent_dim = state_dict["latent_dim"]
-        self.llm_encoder = llm_encoder
+    # def load_model(self, path, llm_encoder):
+    #     state_dict = torch.load(path)
+    #     self.pair_encoder.load_state_dict(state_dict["pair_encoder"])
+    #     self.sequence_encoder.load_state_dict(state_dict["sequence_encoder"])
+    #     self.decoder.load_state_dict(state_dict["decoder"])
+    #     self.latent_dim = state_dict["latent_dim"]
+    #     self.llm_encoder = llm_encoder
 
 
 class VAETrainer(Trainer):
