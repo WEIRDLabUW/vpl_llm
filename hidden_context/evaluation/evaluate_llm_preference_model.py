@@ -10,7 +10,7 @@ from transformers import (
     HfArgumentParser,
 )
 
-from .train_llm_preference_model import (
+from hidden_context.train_llm_preference_model import (
     DataSubset,
     HHRLHFPreprocessor,
     get_hh_rlhf_dataset,

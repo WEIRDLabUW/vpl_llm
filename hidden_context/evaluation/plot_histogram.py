@@ -1,3 +1,5 @@
+# This file is used to plot reward histogram given a specific input
+# TODO: Not compatible with new framework yet!!!
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional, cast

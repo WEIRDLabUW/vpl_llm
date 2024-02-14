@@ -1,3 +1,4 @@
+# This file is used to preprocess dataset, now available for relabeled HH-RLHF
 import os
 from dataclasses import dataclass, field
 from typing import Optional, cast
@@ -6,7 +7,7 @@ from transformers import (
     HfArgumentParser,
 )
 
-from .train_llm_preference_model import (
+from hidden_context.train_llm_preference_model import (
     DataSubset,
     get_hh_rlhf_dataset,
     concatenate_datasets
@@ -14,14 +15,6 @@ from .train_llm_preference_model import (
 from copy import deepcopy
 
 import numpy as np
-
-import sys, ipdb, traceback
-
-def info(type, value, tb):
-    traceback.print_exception(type, value, tb)
-    ipdb.pm()
-
-sys.excepthook = info
 
 
 @dataclass

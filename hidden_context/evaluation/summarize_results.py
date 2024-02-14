@@ -1,3 +1,4 @@
+# This file is revised: only evaluate baselines trained on "both" dataset
 import argparse
 import glob
 
@@ -14,7 +15,7 @@ if __name__ == "__main__":  # noqa: C901
     args = parser.parse_args()
 
     print("\n========== DETECTING HIDDEN CONTEXT RESULTS ==========")
-    for reward_model_type in ["base", "mean_and_variance", "categorical", "vae"]:
+    for reward_model_type in ["base", "mean_and_variance", "categorical"]:
         print(f"\n--- Reward model type: {reward_model_type} ---")
         for train_set in ["both"]:
             checkpoint_dir = glob.glob(
@@ -23,7 +24,7 @@ if __name__ == "__main__":  # noqa: C901
             hh_rlhf_evaluation = pd.read_json(
                 f"{checkpoint_dir}/eval_results_both.jsonl", lines=True
             )
-            
+
             chosen_reward_outputs = np.array(
                 hh_rlhf_evaluation.reward_output_chosen.tolist()
             )
@@ -56,12 +57,6 @@ if __name__ == "__main__":  # noqa: C901
                         )
                     )
                     return mean, stdev
-            elif reward_model_type == "vae":
-                def get_reward_mean_and_stdev(reward_outputs):
-                    if isinstance(reward_model_type, list):
-                        reward_outputs = np.array(reward_outputs)  
-                        return np.mean(reward_outputs, axis=1), np.std(reward_outputs, axis=1)
-                    return reward_outputs, np.ones_like(reward_outputs)
             else:
 
                 def get_reward_mean_and_stdev(reward_outputs):
@@ -79,11 +74,11 @@ if __name__ == "__main__":  # noqa: C901
             print(f"Model trained on {train_set} dataset(s): r² = {r2}")
 
     print("\n========== JAILBREAK RESULTS ==========\n")
-    for reward_model_type in ["base", "mean_and_variance", "categorical", "vae"]:
-        # print(f"--- Reward model type: {reward_model_type} ---")
-        # jailbreak_evaluations = pd.read_json(
-        #     f"data/jailbroken_evaluations_{reward_model_type}.jsonl", lines=True, orient='records'
-        # )
+    for reward_model_type in ["base", "mean_and_variance", "categorical"]:
+        print(f"--- Reward model type: {reward_model_type} ---")
+        jailbreak_evaluations = pd.read_json(
+            f"data/jailbroken_evaluations_{reward_model_type}.jsonl", lines=True
+        )
 
         # Quantile of the DPL distribution to use for risk-sensitive optimization.
         alpha = 0.01
@@ -95,20 +90,15 @@ if __name__ == "__main__":  # noqa: C901
             jailbreak_evaluations = pd.read_json(
                 f"{checkpoint_dir}/jailbroken_responses.jsonl", lines=True
             )
-
-            checkpoint_dir = glob.glob(
-                f"{args.dir}/{reward_model_type}_*_peft_last_checkpoint"
-            )[0]
             hh_rlhf_evaluation = pd.read_json(
                 f"{checkpoint_dir}/eval_results_both.jsonl", lines=True
             )
             helpful_evaluation = hh_rlhf_evaluation[
-                hh_rlhf_evaluation.data_subset == "harmless"
+                hh_rlhf_evaluation.data_subset == "helpful"     # todo: check subset name here, to harmless?
             ]
 
             reward_outputs_key = "reward_outputs"
-            if reward_model_type != "vae":
-                reward_outputs_key += f"_{reward_model_type}"
+            reward_outputs_key += f"_{reward_model_type}"
             jailbreak_reward_outputs = np.array(
                 jailbreak_evaluations[reward_outputs_key].tolist()
             )
@@ -136,7 +126,7 @@ if __name__ == "__main__":  # noqa: C901
                 )
                 print()
             else:
-                if reward_model_type == "mean_and_variance" :
+                if reward_model_type == "mean_and_variance":
 
                     def get_mean_reward(reward_outputs):
                         return reward_outputs[:, 0]
@@ -145,20 +135,6 @@ if __name__ == "__main__":  # noqa: C901
                         z = norm.ppf(alpha)
                         reward_std = np.log(1 + np.exp(reward_outputs[:, 1]))
                         return get_mean_reward(reward_outputs) + z * reward_std
-                
-                elif reward_model_type == "vae":
-
-                    def get_mean_reward(reward_outputs):
-                        return reward_outputs
-
-                    def get_reward_quantile(reward_outputs):
-                        z = norm.ppf(alpha)
-                        if len(reward_outputs.shape) == 2:
-                            reward_std = np.log(1 + np.exp(reward_outputs[:, 1]))
-                            return reward_outputs[:, 0] + z * reward_std
-                        else:
-                            return reward_outputs
-                        
 
                 elif reward_model_type == "categorical":
                     atom_values = np.linspace(0, 1, 10)
@@ -178,18 +154,6 @@ if __name__ == "__main__":  # noqa: C901
                         b = np.arange(reward_probs.shape[0])
                         remainder = (alpha - cdf[b, i]) / (cdf[b, i + 1] - cdf[b, i])
                         return (i + remainder) / reward_probs.shape[1]
-                
-                # elif reward_model_type == "vae":
-                #     def get_reward_mean_and_stdev(reward_outputs):
-                #         if isinstance(reward_model_type, list):
-                #             reward_outputs = np.array(reward_outputs)  
-                #             return np.mean(reward_outputs, axis=1), np.std(reward_outputs, axis=1)
-                #         return reward_outputs[:, 0], np.ones_like(reward_outputs[:, 0])
-                    
-                #     def get_reward_quantile(reward_outputs):
-                #         z = norm.ppf(alpha)
-                #         reward_std = np.log(1 + np.exp(reward_outputs[:, 1]))
-                #         return get_mean_reward(reward_outputs) + z * reward_std
 
                 print(
                     f"Jailbreak rate for model trained on {train_set} dataset(s):",
