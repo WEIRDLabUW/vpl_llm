@@ -99,7 +99,7 @@ class ScriptArguments:
         },
     )
     fp16: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "This essentially cuts the training time in half if you want to "
             "sacrifice a little precision and have a supported GPU."

@@ -98,7 +98,7 @@ class ScriptArguments:
         },
     )
     fp16: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "This essentially cuts the training time in half if you want to "
             "sacrifice a little precision and have a supported GPU."
@@ -153,10 +153,12 @@ class HHRLHFPreprocessor(object):
             "input_ids_rejected": [],
             "attention_mask_rejected": [],
             "contexts": [],
+            "max_lengths": []
         }
         for chosen, rejected, contexts in zip(
             examples["chosen"], examples["rejected"], examples["contexts"]
         ):
+            max_length = 0
             tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
             tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
             new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
@@ -167,10 +169,13 @@ class HHRLHFPreprocessor(object):
             new_examples["attention_mask_rejected"].append(
                 tokenized_rejected["attention_mask"]
             )
+            max_length = max(max_length, len(tokenized_chosen["input_ids"]))
+            max_length = max(max_length, len(tokenized_rejected["input_ids"]))
 
             tokenized_context = []
             # Tokenize the contexts.
-            for chosen, rejected in zip(contexts["chosen"], contexts["rejected"]):
+            for context in contexts:
+                chosen, rejected = context["chosen"], context["rejected"]
                 tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
                 tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
                 tokenized_context.append(
@@ -181,7 +186,10 @@ class HHRLHFPreprocessor(object):
                         "attention_mask_rejected": tokenized_rejected["attention_mask"],
                     }
                 )
+                max_length = max(max_length, len(tokenized_chosen["input_ids"]))
+                max_length = max(max_length, len(tokenized_rejected["input_ids"]))
             new_examples["contexts"].append(tokenized_context)
+            new_examples["max_lengths"].append(max_length)
         return new_examples
 
 
@@ -193,6 +201,8 @@ if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
     script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
 
+    torch.set_default_dtype(torch.bfloat16 if script_args.bf16 else torch.float32)
+    
     data_subset = cast(DataSubset, script_args.data_subset)
     train_dataset = get_hh_rlhf_dataset(
         data_subset,
@@ -250,7 +260,7 @@ if __name__ == "__main__":
         bf16=script_args.bf16,
         fp16=script_args.fp16,
         logging_strategy="steps",
-        logging_steps=10,
+        logging_steps=1000,
         optim=script_args.optim,
         lr_scheduler_type=lr_scheduler_type,
         report_to="wandb",
@@ -303,8 +313,8 @@ if __name__ == "__main__":
         remove_columns=original_columns,
     )
     train_dataset = train_dataset.filter(
-        lambda x: len(x["input_ids_chosen"]) <= script_args.max_length
-        and len(x["input_ids_rejected"]) <= script_args.max_length
+        lambda x: x["max_lengths"] <= script_args.max_length
+        # and len(x["input_ids_rejected"]) <= script_args.max_length
     )
 
     eval_dataset = eval_dataset.map(
@@ -314,8 +324,8 @@ if __name__ == "__main__":
         remove_columns=original_columns,
     )
     eval_dataset = eval_dataset.filter(
-        lambda x: len(x["input_ids_chosen"]) <= script_args.max_length
-        and len(x["input_ids_rejected"]) <= script_args.max_length
+        lambda x: x["max_lengths"] <= script_args.max_length
+        # and len(x["input_ids_rejected"]) <= script_args.max_length
     )
 
     # We need to define a special data collator that batches the data in our j vs k format.
@@ -371,33 +381,18 @@ if __name__ == "__main__":
                 context_lengths.append(len(feature["contexts"]))
 
             batch = self.tokenizer.pad(
-                features_chosen + features_rejected,
+                features_chosen + features_rejected + features_context_chosen + features_context_rejected,
                 padding=self.padding,
                 max_length=self.max_length,
                 pad_to_multiple_of=self.pad_to_multiple_of,
                 return_tensors=self.return_tensors,
             )
 
-            context_batch = self.tokenizer.pad(
-                features_context_chosen + features_context_rejected,
-                padding=self.padding,
-                max_length=self.max_length,
-                pad_to_multiple_of=self.pad_to_multiple_of,
-                return_tensors=self.return_tensors,
-            )
-
-            input_ids = batch["input_ids"].view(
+            input_ids = batch["input_ids"][:2*batch_size].view(
                 2, batch_size, batch["input_ids"].shape[-1]
             )
-            attention_mask = batch["attention_mask"].view(
+            attention_mask = batch["attention_mask"][:2*batch_size].view(
                 2, batch_size, batch["attention_mask"].shape[-1]
-            )
-
-            context_ids = context_batch["input_ids"].view(
-                2, context_lengths[-1], context_batch["input_ids"].shape[-1]
-            )
-            context_attention_mask = context_batch["attention_mask"].view(
-                2, context_lengths[-1], context_batch["attention_mask"].shape[-1]
             )
 
             context_lengths = torch.cumsum(torch.tensor(context_lengths), dim=0)
@@ -405,6 +400,12 @@ if __name__ == "__main__":
                 [context_lengths[:-1], context_lengths[1:]], dim=1
             )
             assert len(seq_start_end) == batch_size
+            context_ids = batch["input_ids"][2*batch_size:].view(
+                2, context_lengths[-1], batch["input_ids"].shape[-1]
+            )
+            context_attention_mask = batch["attention_mask"][2*batch_size:].view(
+                2, context_lengths[-1], batch["attention_mask"].shape[-1]
+            )
 
             return {
                 "input_ids_chosen": input_ids[0],
@@ -415,6 +416,7 @@ if __name__ == "__main__":
                 "attention_mask_context_chosen": context_attention_mask[0],
                 "input_ids_context_rejected": context_ids[1],
                 "attention_mask_context_rejected": context_attention_mask[1],
+                "seq_start_end": seq_start_end,
                 "return_loss": True,
             }
 

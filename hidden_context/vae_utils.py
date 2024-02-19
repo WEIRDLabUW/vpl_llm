@@ -63,7 +63,7 @@ class SequenceEncoder(nn.Module):
 
         mean = self.mean_layer(outputs)
         log_var = self.log_var_layer(outputs)
-        return outputs, mean, log_var
+        return mean, log_var
 
 
 class Decoder(nn.Module):
@@ -80,8 +80,8 @@ class Decoder(nn.Module):
     def forward(self, xc, xr, z):
         xc = torch.cat([xc, z], dim=1)
         xr = torch.cat([xr, z], dim=1)
-        rc = self.Decoder(xc)
-        rr = self.Decoder(xr)
+        rc = self._model(xc)
+        rr = self._model(xr)
         return rc, rr
 
 
@@ -90,7 +90,7 @@ class VAEModel(nn.Module):
         super(VAEModel, self).__init__()
         self.llm_encoder = llm_encoder
         self.pair_encoder = PairEncoder(embed_dim, hidden_dim, latent_dim)
-        self.sequence_encoder = SequenceEncoder(embed_dim, latent_dim)
+        self.sequence_encoder = SequenceEncoder(latent_dim, latent_dim)
         self.decoder = Decoder(embed_dim + latent_dim, hidden_dim)
 
         self.latent_dim = latent_dim
@@ -117,6 +117,7 @@ class VAEModel(nn.Module):
         context_rejected,
         seq_start_end,
     ):
+        # import pdb; pdb.set_trace()
         pair_embed = self.encode_pair(context_chosen, context_rejected)
 
         mean, log_var = self.encode_sequence(pair_embed, seq_start_end)
@@ -164,13 +165,12 @@ class VAETrainer(Trainer):
         return torch.mean(self.per_sample_loss(rewards_chosen, rewards_rejected))
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        embeddings = model(
+        # import pdb; pdb.set_trace()
+        embeddings = model.llm_encoder(
             torch.concatenate(
                 [
                     inputs["input_ids_chosen"],
                     inputs["input_ids_rejected"],
-                    inputs["context_input_ids_chosen"],
-                    inputs["context_input_ids_rejected"],
                 ],
                 dim=0,
             ),
@@ -178,8 +178,6 @@ class VAETrainer(Trainer):
                 [
                     inputs["attention_mask_chosen"],
                     inputs["attention_mask_rejected"],
-                    inputs["context_attention_mask_chosen"],
-                    inputs["context_attention_mask_rejected"],
                 ],
                 dim=0,
             ),
@@ -189,9 +187,11 @@ class VAETrainer(Trainer):
         target_chosen = embeddings[:batch_size]
         target_rejected = embeddings[batch_size:2*batch_size]
 
-        context = embeddings[2*batch_size:]
-        context_chosen = embeddings[: len(context) // 2]
-        context_rejected = embeddings[len(context) // 2 :]
+        # context = embeddings[2*batch_size:]
+        # context_chosen = context[: len(context) // 2]
+        # context_rejected = context[len(context) // 2 :]
+        context_chosen = model.llm_encoder(inputs["input_ids_context_chosen"], inputs["attention_mask_context_chosen"])[0]
+        context_rejected = model.llm_encoder(inputs["input_ids_context_rejected"], inputs["attention_mask_context_rejected"])[0]
         seq_start_end = inputs["seq_start_end"]
 
         rewards_chosen, rewards_rejected, mean, log_var = model(
@@ -240,15 +240,13 @@ class VAETrainer(Trainer):
 
     @classmethod
     def compute_metrics(cls, eval_prediction: EvalPrediction):
-        rewards_chosen, rewards_rejected, mean, log_var, model_mean, model_log_var = (
+        rewards_chosen, rewards_rejected, mean, log_var = (
             eval_prediction.predictions
         )
         rewards_chosen = torch.from_numpy(rewards_chosen)
         rewards_rejected = torch.from_numpy(rewards_rejected)
         mean = torch.from_numpy(mean)
         log_var = torch.from_numpy(log_var)
-        model_mean = torch.from_numpy(model_mean).view(mean.shape)
-        model_log_var = torch.from_numpy(model_log_var).view(log_var.shape)
 
         loss = cls.per_sample_loss(rewards_chosen, rewards_rejected)
         kld = -torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
