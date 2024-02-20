@@ -99,7 +99,7 @@ class ScriptArguments:
         },
     )
     fp16: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "This essentially cuts the training time in half if you want to "
             "sacrifice a little precision and have a supported GPU."
@@ -373,13 +373,17 @@ if __name__ == "__main__":
         "train",
         script_args.train_dataset_size,
         data_path=script_args.data_path,
+        use_subset_as_dir=True
     )
+    print(len(train_dataset))
     eval_dataset = get_hh_rlhf_dataset(
         data_subset,
         "test",
         script_args.eval_dataset_size,
         data_path=script_args.data_path,
+        use_subset_as_dir=True
     )
+    print(len(eval_dataset))
 
     reward_model_type = cast(RewardModelType, script_args.reward_model_type)
 
@@ -490,6 +494,7 @@ if __name__ == "__main__":
         lambda x: len(x["input_ids_chosen"]) <= script_args.max_length
         and len(x["input_ids_rejected"]) <= script_args.max_length
     )
+    print(len(train_dataset))
 
     eval_dataset = eval_dataset.map(
         HHRLHFPreprocessor(tokenizer),
@@ -501,6 +506,7 @@ if __name__ == "__main__":
         lambda x: len(x["input_ids_chosen"]) <= script_args.max_length
         and len(x["input_ids_rejected"]) <= script_args.max_length
     )
+    print(len(eval_dataset))
 
     # We need to define a special data collator that batches the data in our j vs k format.
     @dataclass
