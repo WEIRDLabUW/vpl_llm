@@ -86,7 +86,7 @@ class Decoder(nn.Module):
 
 
 class VAEModel(nn.Module):
-    def __init__(self, embed_dim, hidden_dim, latent_dim, llm_encoder):
+    def __init__(self, embed_dim, hidden_dim, latent_dim, llm_encoder, use_fixed_contexts=False):
         super(VAEModel, self).__init__()
         self.llm_encoder = llm_encoder
         self.pair_encoder = PairEncoder(embed_dim, hidden_dim, latent_dim)
@@ -94,6 +94,7 @@ class VAEModel(nn.Module):
         self.decoder = Decoder(embed_dim + latent_dim, hidden_dim)
 
         self.latent_dim = latent_dim
+        self.use_fixed_contexts = use_fixed_contexts
 
     def reparameterization(self, mean, var):
         epsilon = torch.randn_like(var).to(mean.device)  # sampling epsilon
@@ -187,11 +188,17 @@ class VAETrainer(Trainer):
         target_chosen = embeddings[:batch_size]
         target_rejected = embeddings[batch_size:2*batch_size]
 
-        # context = embeddings[2*batch_size:]
-        # context_chosen = context[: len(context) // 2]
-        # context_rejected = context[len(context) // 2 :]
-        context_chosen = model.llm_encoder(inputs["input_ids_context_chosen"], inputs["attention_mask_context_chosen"])[0]
-        context_rejected = model.llm_encoder(inputs["input_ids_context_rejected"], inputs["attention_mask_context_rejected"])[0]
+        if "embeddings_context_chosen" not in inputs.keys():
+            # context = embeddings[2*batch_size:]
+            # context_chosen = context[: len(context) // 2]
+            # context_rejected = context[len(context) // 2 :]
+            context_chosen = model.llm_encoder(
+                inputs["input_ids_context_chosen"], inputs["attention_mask_context_chosen"])[0]
+            context_rejected = model.llm_encoder(
+                inputs["input_ids_context_rejected"], inputs["attention_mask_context_rejected"])[0]
+        else:
+            context_chosen = torch.tensor(inputs["embeddings_context_chosen"]).to(embeddings.device)
+            context_rejected = torch.tensor(inputs["embeddings_context_rejected"]).to(embeddings.device)
         seq_start_end = inputs["seq_start_end"]
 
         rewards_chosen, rewards_rejected, mean, log_var = model(

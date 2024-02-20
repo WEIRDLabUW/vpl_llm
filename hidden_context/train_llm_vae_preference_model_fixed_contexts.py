@@ -179,23 +179,10 @@ class HHRLHFPreprocessor(object):
             max_length = max(max_length, len(tokenized_chosen["input_ids"]))
             max_length = max(max_length, len(tokenized_rejected["input_ids"]))
 
-            tokenized_context = []
-            # Tokenize the contexts.
-            for context in contexts:
-                chosen, rejected = context["chosen"], context["rejected"]
-                tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
-                tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
-                tokenized_context.append(
-                    {
-                        "input_ids_chosen": tokenized_chosen["input_ids"],
-                        "attention_mask_chosen": tokenized_chosen["attention_mask"],
-                        "input_ids_rejected": tokenized_rejected["input_ids"],
-                        "attention_mask_rejected": tokenized_rejected["attention_mask"],
-                    }
-                )
-                max_length = max(max_length, len(tokenized_chosen["input_ids"]))
-                max_length = max(max_length, len(tokenized_rejected["input_ids"]))
-            new_examples["contexts"].append(tokenized_context)
+            contexts_embeddings = [{"embedding_chosen": context["embedding_chosen"],
+                                    "embedding_rejected": context["embedding_rejected"]}
+                                   for context in contexts]
+            new_examples["contexts"].append(contexts_embeddings)
             new_examples["max_lengths"].append(max_length)
         return new_examples
 
@@ -218,8 +205,8 @@ class RewardDataCollatorWithPadding:
         batch_size = len(features)
         features_chosen = []
         features_rejected = []
-        features_context_chosen = []
-        features_context_rejected = []
+        embeddings_context_chosen = []
+        embeddings_context_rejected = []
         context_lengths = [0]
         for feature in features:
             features_chosen.append(
@@ -234,41 +221,32 @@ class RewardDataCollatorWithPadding:
                     "attention_mask": feature["attention_mask_rejected"],
                 }
             )
-
             # Creating a flattened list of contexts.
-            features_context_chosen.extend(
+            embeddings_context_chosen.extend(
                 [
-                    {
-                        "input_ids": context["input_ids_chosen"],
-                        "attention_mask": context["attention_mask_chosen"],
-                    }
-                    for context in feature["contexts"]
+                    context["embedding_chosen"] for context in feature["contexts"]
                 ]
             )
-            features_context_rejected.extend(
+            embeddings_context_rejected.extend(
                 [
-                    {
-                        "input_ids": context["input_ids_rejected"],
-                        "attention_mask": context["attention_mask_rejected"],
-                    }
-                    for context in feature["contexts"]
+                    context["embedding_rejected"] for context in feature["contexts"]
                 ]
             )
             # Keep track of the start and end of each sequence.
             context_lengths.append(len(feature["contexts"]))
 
         batch = self.tokenizer.pad(
-            features_chosen + features_rejected + features_context_chosen + features_context_rejected,
+            features_chosen + features_rejected,
             padding=self.padding,
             max_length=self.max_length,
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=self.return_tensors,
         )
 
-        input_ids = batch["input_ids"][:2 * batch_size].view(
+        input_ids = batch["input_ids"].view(
             2, batch_size, batch["input_ids"].shape[-1]
         )
-        attention_mask = batch["attention_mask"][:2 * batch_size].view(
+        attention_mask = batch["attention_mask"].view(
             2, batch_size, batch["attention_mask"].shape[-1]
         )
 
@@ -277,29 +255,20 @@ class RewardDataCollatorWithPadding:
             [context_lengths[:-1], context_lengths[1:]], dim=1
         )
         assert len(seq_start_end) == batch_size
-        context_ids = batch["input_ids"][2 * batch_size:].view(
-            2, context_lengths[-1], batch["input_ids"].shape[-1]
-        )
-        context_attention_mask = batch["attention_mask"][2 * batch_size:].view(
-            2, context_lengths[-1], batch["attention_mask"].shape[-1]
-        )
 
         return {
             "input_ids_chosen": input_ids[0],
             "attention_mask_chosen": attention_mask[0],
             "input_ids_rejected": input_ids[1],
             "attention_mask_rejected": attention_mask[1],
-            "input_ids_context_chosen": context_ids[0],
-            "attention_mask_context_chosen": context_attention_mask[0],
-            "input_ids_context_rejected": context_ids[1],
-            "attention_mask_context_rejected": context_attention_mask[1],
+            "embeddings_context_chosen": embeddings_context_chosen,
+            "embeddings_context_rejected": embeddings_context_rejected,
             "seq_start_end": seq_start_end,
             "return_loss": True,
         }
 
 
 if __name__ == "__main__":
-    ipdb.set_trace()
     parser = HfArgumentParser(ScriptArguments)
     script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
 
@@ -394,7 +363,7 @@ if __name__ == "__main__":
     )
     # We multiply the final linear layer's weights by 0.01 because this seems to
     # significantly stabilize training and lead to better optimization of the loss.
-    # model.score.weight.data *= 0.01
+    model.score.weight.data *= 0.01     # todo
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 
@@ -433,7 +402,7 @@ if __name__ == "__main__":
     # Train the model.
     latent_dim = script_args.latent_dim
     hidden_dim = script_args.hidden_dim
-    vae_model = VAEModel(embed_dim, hidden_dim, latent_dim, model)
+    vae_model = VAEModel(embed_dim, hidden_dim, latent_dim, model, use_fixed_contexts=True)
 
     trainer = trainer_class(
         model=vae_model,
