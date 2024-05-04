@@ -15,7 +15,7 @@ from transformers import (
     AutoModelForCausalLM,
 )
 from transformers.utils import PaddingStrategy
-from .vae_utils import VAETrainer, VAEModel
+from .vae_utils import VAETrainer, VAEModel, VQVAETrainer, VQVAE_Encoder
 
 from .train_llm_preference_model import (
     get_step_decay_lr_lambda,
@@ -254,6 +254,7 @@ class HHRLHFPreprocessor(object):
 
 trainer_classes: Dict[RewardModelType, Type[VAETrainer]] = {
     "vae": VAETrainer,
+    "vqvae": VQVAETrainer
 }
 
 
@@ -607,8 +608,12 @@ if __name__ == "__main__":
     embed_dim = script_args.embed_dim
 
     if not script_args.use_causal_lm:
+        if script_args.reward_model_type == "vqvae":
+            num_labels = 1
+        else:
+            num_labels = embed_dim
         model = AutoModelForSequenceClassification.from_pretrained(
-            script_args.model_name, num_labels=embed_dim, torch_dtype=torch.bfloat16
+            script_args.model_name, num_labels=num_labels, torch_dtype=torch.bfloat16
         )
         # We multiply the final linear layer's weights by 0.01 because this seems to
         # significantly stabilize training and lead to better optimization of the loss.
@@ -653,10 +658,32 @@ if __name__ == "__main__":
     # Train the model.
     latent_dim = script_args.latent_dim
     hidden_dim = script_args.hidden_dim
-    vae_model = VAEModel(embed_dim, hidden_dim, latent_dim, model,
-                         fixed_contexts=script_args.fixed_contexts,
-                         fixed_llm_embeddings=script_args.fixed_llm_embeddings,
-                         use_causal_lm=script_args.use_causal_lm,)
+    if script_args.reward_model_type == "vae":
+        vae_model = VAEModel(embed_dim, hidden_dim, latent_dim, model,
+                             fixed_contexts=script_args.fixed_contexts,
+                             fixed_llm_embeddings=script_args.fixed_llm_embeddings,
+                             use_causal_lm=script_args.use_causal_lm,)
+    elif script_args.reward_model_type == "vqvae":
+        if script_args.model_name == 'gpt2':
+            embed_dim = 768
+        if script_args.model_name == 'meta-llama/Llama-2-7b-hf':
+            embed_dim = 4096
+            
+        if script_args.use_causal_lm:
+            context_dim = embed_dim
+        else:
+            context_dim = script_args.embed_dim
+            
+        vae_model = VQVAE_Encoder(
+            script_args.n_embeddings,
+            embed_dim,
+            hidden_dim,
+            model,
+            context_dim=context_dim,
+            fixed_contexts=script_args.fixed_contexts,
+            fixed_llm_embeddings=script_args.fixed_llm_embeddings,
+            use_causal_lm=script_args.use_causal_lm,
+        )
 
     trainer = trainer_class(
         model=vae_model,
