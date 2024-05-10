@@ -180,17 +180,17 @@ def generate_embeddings_with_llm(args, input_dataset=None):
             attention_mask = tokens["attention_mask"].unsqueeze(0).to("cuda")
             with torch.no_grad():
                 if not args.use_causal_lm:
-                    # emb[f"embedding_{key}"] = model(
-                    #     input_ids=input_ids,
-                    #     attention_mask=attention_mask
-                    # )[0][0].float().cpu().numpy()
-                    # import ipdb; ipdb.set_trace()
-                    last_hidden_state = model(
+                    emb[f"embedding_{key}"] = model(
                         input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_hidden_states=True
-                    ).hidden_states[-1]
-                    emb[f"embedding_{key}"] = last_hidden_state[0][token_length - 1].float().cpu().numpy()
+                        attention_mask=attention_mask
+                    )[0][0].float().cpu().numpy()
+                    # import ipdb; ipdb.set_trace()
+                    # last_hidden_state = model(
+                    #     input_ids=input_ids,
+                    #     attention_mask=attention_mask,
+                    #     output_hidden_states=True
+                    # ).hidden_states[-1]
+                    # emb[f"embedding_{key}"] = last_hidden_state[0][token_length - 1].float().cpu().numpy()
                 else:
                     last_hidden_state = model(
                         input_ids=input_ids,
@@ -227,8 +227,9 @@ def generate_contexts(args, input_dataset):
         for row_id in tqdm(range(dataset_size)):  # iterate over all samples in original dataset
             row_contexts = list()
             num_context = 0
-            controversial_subset = input_dataset.filter(lambda example: example['controversial'] == True)
-            controversial_size = len(controversial_subset)
+            if args.add_controversial:
+                controversial_subset = input_dataset.filter(lambda example: example['controversial'] == True)
+                controversial_size = len(controversial_subset)
             while num_context < context_lengths[row_id]:
                 if args.add_controversial:
                     random_id = np.random.randint(controversial_size)

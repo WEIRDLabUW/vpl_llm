@@ -22,7 +22,7 @@ from transformers import (
 from transformers.trainer_utils import EvalPrediction
 from transformers.utils import PaddingStrategy
 from typing_extensions import Literal, TypeAlias
-
+from transformers.optimization import get_cosine_schedule_with_warmup
 import sys, ipdb, traceback
 
 
@@ -55,7 +55,7 @@ class ScriptArguments:
     per_device_eval_batch_size: int = field(default=1)
     gradient_accumulation_steps: int = field(default=1)
     learning_rate: float = field(default=3e-6)
-    weight_decay: float = field(default=0.001)
+    weight_decay: float = field(default=0.000)
     model_name: str = field(
         default="gpt2",
         metadata={
@@ -151,6 +151,7 @@ class ScriptArguments:
     seed: int = field(default=0)
     up_sampling: bool = field(default=False)
     other_subsets: str = field(default=None)
+    data_ratio: float = field(default=1.0)
 
 
 class HHRLHFPreprocessor(object):
@@ -242,15 +243,22 @@ class RewardTrainer(Trainer):
         return loss
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
-        if self.lr_lambda is not None:
-            lr_lambda = partial(
-                self.lr_lambda,
-                num_training_steps=num_training_steps,
-            )
-            self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
-            return self.lr_scheduler
-        else:
-            return super().create_scheduler(num_training_steps, optimizer)
+        # if self.lr_lambda is not None:
+        #     lr_lambda = partial(
+        #         self.lr_lambda,
+        #         num_training_steps=num_training_steps,
+        #     )
+        #     self.lr_scheduler = LambdaLR(optimizer, lr_lambda)
+        #     return self.lr_scheduler
+        # else:
+        #     return super().create_scheduler(num_training_steps, optimizer)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(0.03 * num_training_steps),
+            num_training_steps=num_training_steps
+        )
+        self.lr_scheduler = scheduler
+        return scheduler
 
     @classmethod
     def compute_metrics(cls, eval_prediction: EvalPrediction):
@@ -451,6 +459,12 @@ if __name__ == "__main__":
         use_subset_as_dir=True,
         other_subsets=script_args.other_subsets
     )
+    if script_args.data_ratio < 0.99:
+        train_dataset_len = int(script_args.data_ratio * len(train_dataset))
+        eval_dataset_len = int(script_args.data_ratio * len(eval_dataset))
+        train_dataset = train_dataset.select(range(train_dataset_len))
+        eval_dataset = eval_dataset.select(range(eval_dataset_len))
+    
     print(len(train_dataset), len(eval_dataset))
     if script_args.controversial_only:
         train_dataset = train_dataset.filter(lambda example: example['controversial'] == True)
@@ -484,10 +498,11 @@ if __name__ == "__main__":
     else:
         lr_scheduler_type = script_args.lr_scheduler_type
 
-    if len(train_dataset) <= 4000:
-        eval_steps = 20
-    else:
-        eval_steps = 4000
+    # if len(train_dataset) <= 4000:
+    #     eval_steps = 20
+    # else:
+    #     eval_steps = 4000
+    eval_steps = len(train_dataset) // 10
     training_args = TrainingArguments(
         output_dir=output_name,
         learning_rate=script_args.learning_rate,
@@ -496,7 +511,7 @@ if __name__ == "__main__":
         num_train_epochs=script_args.num_train_epochs,
         weight_decay=script_args.weight_decay,
         evaluation_strategy="steps",
-        eval_steps=eval_steps,
+        eval_steps=0.1,
         save_strategy="steps",
         save_steps=1000,
         gradient_accumulation_steps=script_args.gradient_accumulation_steps,
@@ -525,8 +540,8 @@ if __name__ == "__main__":
     peft_config = LoraConfig(
         task_type=TaskType.SEQ_CLS,
         inference_mode=False,
-        r=8,
-        lora_alpha=32,
+        r=128, #8,
+        lora_alpha=256, #32,
         lora_dropout=0.1,
     )
 

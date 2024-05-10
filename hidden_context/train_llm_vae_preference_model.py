@@ -15,9 +15,9 @@ from transformers import (
     AutoModelForCausalLM,
 )
 from transformers.utils import PaddingStrategy
-from .vae_utils import VAETrainer, VAEModel, VQVAETrainer, VQVAE_Encoder
+from vae_utils import VAETrainer, VAEModel, VQVAETrainer, VQVAE_Encoder
 
-from .train_llm_preference_model import (
+from train_llm_preference_model import (
     get_step_decay_lr_lambda,
     get_cosine_decay_lr_lambda,
     RewardModelType,
@@ -25,6 +25,7 @@ from .train_llm_preference_model import (
     get_hh_rlhf_dataset,
     concatenate_datasets
 )
+from transformers.optimization import get_cosine_schedule_with_warmup
 
 import sys, ipdb, traceback
 
@@ -55,7 +56,7 @@ class ScriptArguments:
     per_device_eval_batch_size: int = field(default=1)
     gradient_accumulation_steps: int = field(default=1)
     learning_rate: float = field(default=3e-6)
-    weight_decay: float = field(default=0.001)
+    weight_decay: float = field(default=0.000)
     model_name: str = field(
         default="gpt2",
         metadata={
@@ -160,14 +161,17 @@ class ScriptArguments:
     up_sampling: bool = field(default=False)
     other_subsets: str = field(default=None)
     use_last_token_embedding: bool = field(default=False)
-    one_user: str = field(default=None)
+    data_ratio: float = field(default=1.0)
+    n_embeddings: int = field(default=2)
+    append_gt_prompt: bool = field(default=True)
 
 
 class HHRLHFPreprocessor(object):
-    def __init__(self, args, tokenizer, **tokenizer_kwargs):
+    def __init__(self, append_gt_prompt, args, tokenizer, **tokenizer_kwargs):
         self.tokenizer = tokenizer
         self.args = args
         self.tokenizer_kwargs = tokenizer_kwargs
+        self.append_gt_prompt = append_gt_prompt
 
     def __call__(self, examples):
         if self.args.fixed_llm_embeddings:
@@ -206,11 +210,21 @@ class HHRLHFPreprocessor(object):
         ):
             max_length = 0
             # mapping = {
-            #     "helpful": "[This is User A] ",
-            #     "harmless": "[This is User B] ",
+            #     "helpful": "This is user helpful. So is this is a statement that would be preferred by user helpful.",
+            #     "harmless": "This is user harmless . So is this is a statement that would be preferred by user harmless.",
             # }
-            # chosen = mapping[user_type] + chosen
-            # rejected = mapping[user_type] + rejected
+            # helpfulness honesty instruction_following truthfulness
+            if self.append_gt_prompt:
+                mapping = {
+                "8": "This is user helpful. So this is a statement that would be preferred by user helpful.",
+                "4": "This is user honest. So this is a statement that would be preferred by user honest.",
+                "2": "This is user instruction_following. So this is a statement that would be preferred by user instruction_following.",
+                "1": "This is user truthfulness. So this is a statement that would be preferred by user truthfulness.",
+                "helpful": "This is user helpful. So this is a statement that would be preferred by user helpful.",
+                "harmless": "This is user harmless . So is this is a statement that would be preferred by user harmless.",
+                }
+                chosen = mapping[user_type] + chosen
+                rejected = mapping[user_type] + rejected
             tokenized_chosen = self.tokenizer(chosen, **self.tokenizer_kwargs)
             tokenized_rejected = self.tokenizer(rejected, **self.tokenizer_kwargs)
             new_examples["input_ids_chosen"].append(tokenized_chosen["input_ids"])
@@ -519,6 +533,12 @@ if __name__ == "__main__":
         data_path=script_args.data_path,
         other_subsets=script_args.other_subsets
     )
+    if script_args.data_ratio < 0.99:
+        train_dataset_len = int(script_args.data_ratio * len(train_dataset))
+        eval_dataset_len = int(script_args.data_ratio * len(eval_dataset))
+        train_dataset = train_dataset.select(range(train_dataset_len))
+        eval_dataset = eval_dataset.select(range(eval_dataset_len))
+    
     print(len(train_dataset), len(eval_dataset))
     if script_args.controversial_only:
         train_dataset = train_dataset.filter(lambda example: example['controversial'] == True)
@@ -526,9 +546,6 @@ if __name__ == "__main__":
     elif script_args.up_sampling:
         train_dataset = up_sample_controversial(train_dataset, seed)
 
-    if script_args.one_user:
-        train_dataset = train_dataset.filter(lambda example: example['data_subset'] == script_args.one_user)
-        eval_dataset = eval_dataset.filter(lambda example: example['data_subset'] == script_args.one_user)
     reward_model_type = cast(RewardModelType, script_args.reward_model_type)
 
     # Define the training args. Needs to be done before the model is loaded if you
@@ -552,10 +569,10 @@ if __name__ == "__main__":
     else:
         lr_scheduler_type = script_args.lr_scheduler_type
 
-    if len(train_dataset) <= 4000:
-        eval_steps = 50
-    else:
-        eval_steps = 500
+    # if len(train_dataset) < 1000:
+    #     eval_steps = 20
+    # else:
+    # eval_steps = len(train_dataset) // 10
     training_args = TrainingArguments(
         output_dir=output_name,
         learning_rate=script_args.learning_rate,
@@ -564,7 +581,7 @@ if __name__ == "__main__":
         num_train_epochs=script_args.num_train_epochs,
         weight_decay=script_args.weight_decay,
         evaluation_strategy="steps",
-        eval_steps=eval_steps,
+        eval_steps=0.1,
         save_strategy="steps",
         save_steps=10000,
         gradient_accumulation_steps=script_args.gradient_accumulation_steps,
@@ -597,8 +614,8 @@ if __name__ == "__main__":
     peft_config = LoraConfig(
         task_type=task_type,
         inference_mode=False,
-        r=8,
-        lora_alpha=32,
+        r=8, #128,
+        lora_alpha=32, #256,
         lora_dropout=0.1,
     )
 
@@ -636,7 +653,7 @@ if __name__ == "__main__":
     original_columns = train_dataset.column_names
 
     train_dataset = train_dataset.map(
-        HHRLHFPreprocessor(script_args, tokenizer),
+        HHRLHFPreprocessor(script_args.append_gt_prompt, script_args, tokenizer),
         batched=True,
         num_proc=num_proc,
         remove_columns=original_columns,
@@ -646,7 +663,7 @@ if __name__ == "__main__":
     )
 
     eval_dataset = eval_dataset.map(
-        HHRLHFPreprocessor(script_args, tokenizer),
+        HHRLHFPreprocessor(script_args.append_gt_prompt, script_args, tokenizer),
         batched=True,
         num_proc=num_proc,
         remove_columns=original_columns,
@@ -699,6 +716,7 @@ if __name__ == "__main__":
         ),
         kl_loss_weight=script_args.kl_loss_weight,
         use_annealing=script_args.use_annealing,
+        tokenizer=tokenizer,
         **trainer_kwargs,
     )
 
